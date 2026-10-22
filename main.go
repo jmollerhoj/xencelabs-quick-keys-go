@@ -243,6 +243,13 @@ func main() {
 	}
 	defer keyboard.Close()
 
+	// Virtual mouse for the WHEEL_UP / WHEEL_DOWN pseudo-keys (e.g. Ctrl+scroll zoom)
+	wheelMouse, err = uinput.CreateMouse("/dev/uinput", []byte("Xencelabs QuickKeys Virtual Wheel"))
+	if err != nil {
+		log.Fatalf("Failed to create virtual mouse: %v", err)
+	}
+	defer wheelMouse.Close()
+
 	// Connect to Device
 	devInfo := findDevice()
 	if devInfo == nil {
@@ -530,6 +537,8 @@ func keyMap(name string) int {
 		"KEY_MINUS": uinput.KeyMinus, "KEY_EQUAL": uinput.KeyEqual,
 		"KEY_LEFTBRACE": uinput.KeyLeftbrace, "KEY_RIGHTBRACE": uinput.KeyRightbrace,
 		"KEY_PAGEUP": uinput.KeyPageup, "KEY_PAGEDOWN": uinput.KeyPagedown,
+		"KEY_KPPLUS": uinput.KeyKpplus, "KEY_KPMINUS": uinput.KeyKpminus,
+		"KEY_DELETE": uinput.KeyDelete,
 		// Arrow Keys
 		"KEY_LEFT": uinput.KeyLeft, "KEY_RIGHT": uinput.KeyRight,
 		"KEY_UP": uinput.KeyUp, "KEY_DOWN": uinput.KeyDown,
@@ -548,8 +557,31 @@ func keyMap(name string) int {
 	return 0
 }
 
+var wheelMouse uinput.Mouse
+
+// wheelDelta maps the WHEEL_UP / WHEEL_DOWN pseudo-keys to a scroll step.
+func wheelDelta(name string) (int32, bool) {
+	switch name {
+	case "WHEEL_UP":
+		return 1, true
+	case "WHEEL_DOWN":
+		return -1, true
+	}
+	return 0, false
+}
+
 func sendKeys(kb uinput.Keyboard, keys []string, press bool) {
 	for _, kName := range keys {
+		if d, ok := wheelDelta(kName); ok {
+			if press {
+				// The scroll comes from a separate device than the modifiers;
+				// give the compositor time to see them held around it.
+				time.Sleep(15 * time.Millisecond)
+				wheelMouse.Wheel(false, d)
+				time.Sleep(15 * time.Millisecond)
+			}
+			continue
+		}
 		code := keyMap(kName)
 		if code != 0 {
 			if press {
@@ -561,11 +593,11 @@ func sendKeys(kb uinput.Keyboard, keys []string, press bool) {
 	}
 }
 
+// sendKeysPressRelease sends the keys as one chord: all down in order, then up
+// in reverse, so modifiers are still held when the last key fires.
 func sendKeysPressRelease(kb uinput.Keyboard, keys []string) {
-	for _, kName := range keys {
-		code := keyMap(kName)
-		if code != 0 {
-			kb.KeyPress(code)
-		}
+	sendKeys(kb, keys, true)
+	for i := len(keys) - 1; i >= 0; i-- {
+		sendKeys(kb, keys[i:i+1], false)
 	}
 }
