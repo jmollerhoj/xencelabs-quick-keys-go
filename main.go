@@ -23,6 +23,22 @@ const (
 	ProdIDWireless = 0x5203
 )
 
+// quickKeys wraps the HID handle so writes reach the remote. Through the
+// wireless dongle every outgoing report must carry the remote's 6-byte ID at
+// offset 10, learned from the dongle's 0xf8 status report.
+type quickKeys struct {
+	*hid.Device
+	wireless bool
+	id       []byte
+}
+
+func (q *quickKeys) Write(b []byte) (int, error) {
+	if q.wireless && q.id != nil {
+		copy(b[10:16], q.id)
+	}
+	return q.Device.Write(b)
+}
+
 // Configuration Structures
 type Config struct {
 	Device DeviceSettings `yaml:"device"`
@@ -241,10 +257,19 @@ func main() {
 
 	log.Printf("Connected to %04x:%04x", devInfo.VendorID, devInfo.ProductID)
 
+	qk := &quickKeys{Device: dev, wireless: devInfo.ProductID == ProdIDWireless}
+
 	// Initialize Global Settings & First Layer
 	currentLayerIdx := 0
-	initGlobalSettings(dev, &config)
-	refreshLayer(dev, config.Layers[currentLayerIdx], config.Device.WheelSpeed, true)
+	if qk.wireless {
+		// Ask the dongle for the remote's status. It answers with an 0xf8
+		// report (and sends another whenever the remote connects or drops);
+		// the read loop initializes the remote once it knows its ID.
+		qk.Write(padBytes([]byte{0x02, 0xb8, 0x01}))
+	} else {
+		initGlobalSettings(qk, &config)
+		refreshLayer(qk, config.Layers[currentLayerIdx], config.Device.WheelSpeed, true)
+	}
 
 	// Setup Signal Handling
 	// We specifically include SIGQUIT here.
@@ -255,7 +280,10 @@ func main() {
 	var prevBtn1, prevBtn2 uint8
 
 	// Optional: Flush/Read initial state to prevent immediate trigger on startup if a button is held
-	if n, err := dev.Read(buf); err == nil && n >= 10 {
+	// (not on the dongle: its first report is the status answer the read loop needs)
+	if qk.wireless {
+		// nothing to flush
+	} else if n, err := dev.Read(buf); err == nil && n >= 10 {
 		offset := 0
 		if buf[0] == 0xf0 {
 			offset = -1
@@ -283,6 +311,27 @@ func main() {
 				offset = -1
 			}
 
+			// Dongle status: 2 = device just connected, 3 = already connected, 4 = lost.
+			// A Pen Tablet bundle dongle also reports the tablet, so only take
+			// the device whose type byte is 0x21 (Quick Keys; the tablet is 0x12).
+			if qk.wireless && buf[offset+1] == 0xf8 {
+				state := buf[offset+2]
+				devType := buf[offset+4]
+				id := buf[offset+10 : offset+16]
+				log.Printf("Dongle status: device %x type %#02x state %d", id, devType, state)
+				if devType == 0x21 && (state == 2 || (state == 3 && !bytes.Equal(qk.id, id))) {
+					qk.id = append([]byte(nil), id...)
+					initGlobalSettings(qk, &config)
+					refreshLayer(qk, config.Layers[currentLayerIdx], config.Device.WheelSpeed, true)
+				}
+				continue
+			}
+
+			// Ignore reports from other devices on the dongle (e.g. the tablet)
+			if qk.wireless && !bytes.Equal(buf[offset+12:offset+18], qk.id) {
+				continue
+			}
+
 			if buf[offset+1] == 0xf0 {
 				keys1 := buf[offset+2]
 				keys2 := buf[offset+3]
@@ -293,7 +342,7 @@ func main() {
 				if layerChanged {
 					currentLayerIdx = (currentLayerIdx + 1) % len(config.Layers)
 					log.Printf("Switching to Layer: %s", config.Layers[currentLayerIdx].Name)
-					refreshLayer(dev, config.Layers[currentLayerIdx], config.Device.WheelSpeed, true)
+					refreshLayer(qk, config.Layers[currentLayerIdx], config.Device.WheelSpeed, true)
 				}
 
 				prevBtn1 = keys1
@@ -332,7 +381,7 @@ func findDevice() *hid.DeviceInfo {
 }
 
 // initGlobalSettings sets things that don't change between layers
-func initGlobalSettings(dev *hid.Device, cfg *Config) {
+func initGlobalSettings(dev *quickKeys, cfg *Config) {
 	dev.Write(padBytes([]byte{0x02, 0xb0, 0x04})) // Subscribe Key events
 	dev.Write(padBytes([]byte{0x02, 0xb4, 0x10})) // Subscribe Battery
 
@@ -344,7 +393,7 @@ func initGlobalSettings(dev *hid.Device, cfg *Config) {
 }
 
 // refreshLayer updates button labels, ring color, wheel speed and shows overlay
-func refreshLayer(dev *hid.Device, layer Layer, globalSpeed string, showOverlay bool) {
+func refreshLayer(dev *quickKeys, layer Layer, globalSpeed string, showOverlay bool) {
 	// Set Color
 	dev.Write(cmdSetWheelColor(layer.Color.R, layer.Color.G, layer.Color.B))
 
